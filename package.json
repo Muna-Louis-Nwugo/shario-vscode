@@ -1,0 +1,25 @@
+{
+  "name": "shario-vscode",
+  "displayName": "Shar",
+  "description": "Shar IDE client",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "shar.connect",
+        "title": "Shar: Connect"
+      },
+      {
+        "command": "shar.sendMessage",
+        "title": "Shar: Send Message"
+      }
+    ]
+  },
+  "dependencies": {
+    "socket.io-client": "^4.0.0"
+  }
+}

@@ -1,3 +1,10 @@
+/*
+ * TESTING INSTRUCTIONS
+ * WSL run "code ."
+ * hit f5
+ * CTRL + Shift + P
+ * try running Shar: Connect or Shar: SendMessage
+ */
 const vscode = require('vscode');
 const { io } = require('socket.io-client');
 

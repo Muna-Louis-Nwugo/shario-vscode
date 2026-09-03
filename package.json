@@ -12,10 +12,6 @@
       {
         "command": "shar.connect",
         "title": "Shar: Connect"
-      },
-      {
-        "command": "shar.sendMessage",
-        "title": "Shar: Send Message"
       }
     ]
   },

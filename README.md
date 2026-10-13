@@ -1,4 +1,4 @@
-# Shario VS Code Extension (Work in Progress)
+# Shario VS Code Extension
 
 The VS Code client for [Shario](https://github.com/Muna-Louis-Nwugo/shario), a real-time collaborative text editor backend built on a CRDT. This extension is the IDE half: it forwards every keystroke to a running `shar` server and applies whatever the server confirms, so multiple editors attached to the same server stay in sync.
 

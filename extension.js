@@ -198,9 +198,10 @@ function activate(context) {
     // for "likely incompatible," not something this extension can verify
     // for real, since there's no version handshake in the wire protocol.
     const updateCmd = vscode.commands.registerCommand('shar.updateServer', async () => {
+        const enableBeta = vscode.workspace.getConfiguration('shario').get('enableBeta', false);
         let latestTag;
         try {
-            latestTag = await fetchLatestReleaseTag();
+            latestTag = await fetchLatestReleaseTag(enableBeta);
         } catch (err) {
             vscode.window.showErrorMessage(`Failed to check for updates: ${err.message}`);
             return;
@@ -598,17 +599,25 @@ function parseMajor(tag) {
     return match ? parseInt(match[1], 10) : null;
 }
 
-// Asks GitHub for the actual newest *stable* shario release (not just the
-// asset redirect used elsewhere) -- needed here since the update command has
-// to compare version *numbers*, not just fetch a file. Deliberately uses
-// /releases/latest, not the plain /releases list -- pre-releases are
-// intentionally excluded (this project marks test/beta releases as
-// pre-release on purpose), so this must never auto-update a plugin onto one.
-function fetchLatestReleaseTag() {
+// Asks GitHub for the actual newest shario release (not just the asset
+// redirect used elsewhere) -- needed here since the update command has to
+// compare version *numbers*, not just fetch a file.
+//
+// By default this uses /releases/latest, which excludes anything marked
+// pre-release (this project marks test/beta releases as pre-release on
+// purpose) -- so this never auto-updates a plugin onto one unless the user
+// explicitly opted in via the `shario.enableBeta` setting, in which case it
+// uses the plain /releases list (newest first, including pre-releases)
+// instead and just takes the first entry.
+function fetchLatestReleaseTag(enableBeta) {
+    const url = enableBeta
+        ? `https://api.github.com/repos/${GITHUB_REPO}/releases`
+        : `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
+
     return new Promise((resolve, reject) => {
         const options = { headers: { 'User-Agent': 'shario-vscode' } };
         https
-            .get(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`, options, (res) => {
+            .get(url, options, (res) => {
                 let body = '';
                 res.on('data', (chunk) => (body += chunk));
                 res.on('end', () => {
@@ -618,11 +627,12 @@ function fetchLatestReleaseTag() {
                     }
                     try {
                         const parsed = JSON.parse(body);
-                        if (!parsed.tag_name) {
-                            reject(new Error("GitHub's response had no tag_name"));
+                        const release = enableBeta ? parsed[0] : parsed;
+                        if (!release || !release.tag_name) {
+                            reject(new Error(enableBeta ? 'No shario releases exist yet' : "GitHub's response had no tag_name"));
                             return;
                         }
-                        resolve(parsed.tag_name);
+                        resolve(release.tag_name);
                     } catch (err) {
                         reject(err);
                     }

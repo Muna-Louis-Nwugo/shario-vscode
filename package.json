@@ -25,7 +25,17 @@
         "command": "shar.updateServer",
         "title": "Shar: Update Server Binary"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Shar",
+      "properties": {
+        "shario.enableBeta": {
+          "type": "boolean",
+          "default": false,
+          "description": "When updating the server binary, allow pre-release (beta) shario versions, not just stable releases."
+        }
+      }
+    }
   },
   "dependencies": {
     "socket.io-client": "^4.0.0"

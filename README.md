@@ -2,8 +2,6 @@
 
 The VS Code client for [Shario](https://github.com/Muna-Louis-Nwugo/shario), a real-time collaborative text editor backend built on a CRDT. This extension is the IDE half: it forwards every keystroke to a running `shar` server and applies whatever the server confirms, so multiple editors attached to the same server stay in sync.
 
-**Status: work in progress.** Connecting to a server, typing, and deleting in a tracked file all work and are covered by the [main repo's benchmark suite](https://github.com/Muna-Louis-Nwugo/shario/blob/main/info/BENCHMARK.md) against real editing-trace datasets. This extension is send-only in the sense that it doesn't yet render incoming edits from *other* collaborators on screen — see Known limitations below.
-
 ## How it works, in short
 
 Every character you type or delete is sent to the server as an `ide-add`/`remove` event, referencing its neighbor by identity (or a disposable local tag, if that neighbor hasn't been confirmed by the server yet) rather than by position — so a fast burst of edits can never let this client's understanding of "where things are" drift from the server's. See the [main repo's architecture doc](https://github.com/Muna-Louis-Nwugo/shario/blob/main/info/ARCHITECTURE.md) for the full protocol and design.

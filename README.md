@@ -12,25 +12,31 @@ If the server process dies, this extension notices and restarts it automatically
 
 ## Setup
 
-Requires the [`shario`](https://github.com/Muna-Louis-Nwugo/shario) server checked out as a sibling directory (`../shario` relative to this one) with a local Rust toolchain, since this extension launches it via `cargo run` when it needs to.
+Just Node.js — this extension no longer needs a local Rust toolchain or a `shario` source checkout. It downloads the right prebuilt `shario` binary for your OS/architecture from [GitHub Releases](https://github.com/Muna-Louis-Nwugo/shario/releases) automatically the first time it needs one, and caches it for later.
 
 ```bash
 npm install        # installs socket.io-client
 code .              # open this folder in VS Code
 ```
 
-Then, inside that VS Code window:
-1. Press `F5` to launch an Extension Development Host.
-2. In the new window, open the folder you want to collaborate on.
-3. Run **"Shar: Connect"** from the command palette (`Ctrl+Shift+P` / `Cmd+Shift+P`).
-4. Type or delete in a file — check the **"Shar"** output channel (`View > Output`, select "Shar" from the dropdown) to see what's being sent.
+Then, inside that VS Code window, press `F5` to launch an Extension Development Host, open the folder you want to collaborate on, and run one of the commands below from the command palette (`Ctrl+Shift+P` / `Cmd+Shift+P`).
 
-If a `shar` server isn't already running for that workspace folder, this extension starts one for you.
+## Commands
+
+- **Shar: Create Session** — starts a brand-new session (prompts for a name, or generates a random one if left blank) and connects to it. Share the name shown afterward with whoever you want to collaborate with.
+- **Shar: Participate in Session** — joins an existing session by the exact name its creator used.
+- **Shar: Connect (attach to an already-running server)** — attaches to a `shar` server that's already running on this machine, without launching anything. Doesn't need a session name; it reads whatever the server was already started with.
+- **Shar: Update Server Binary** — checks GitHub for the newest *stable* shario release and downloads it, warning first if its major version differs from what this extension currently expects (a likely-breaking change). Enable the `shario.enableBeta` setting first if you want this to consider pre-release/beta builds too, not just stable ones.
+
+Type or delete in a tracked file afterward — check the **"Shar"** output channel (`View > Output`, select "Shar" from the dropdown) to see what's being sent, and what the server itself logs.
+
+## Settings
+
+- `shario.enableBeta` (boolean, default `false`) — let **Shar: Update Server Binary** update onto a pre-release shario version, not just the newest stable one.
 
 ## Known limitations
 
 - Doesn't yet apply or render edits made by other collaborators — only sends this editor's own changes out.
-- Deleting content that existed on disk *before* this client connected only resolves correctly once the server's `initial-state` bootstrap event is in place server-side.
 - One extension instance per workspace folder; no UI yet for switching which folder/server you're connected to beyond reconnecting.
 
 ## License

@@ -42,21 +42,22 @@ const https = require('https');
 
 const GITHUB_REPO = 'Muna-Louis-Nwugo/shario';
 
-// The exact shario release this extension version is built/tested against.
-// Bump this (and publish a new extension version) when shario ships a
-// release this extension should follow -- that bump is itself what makes
-// updating the extension also fetch the new server version, since the
-// binary cache is keyed by this tag (see ensureSharBinary). Releases are
-// `shario_vMAJOR.MINOR.PATCH`; a MAJOR bump means a breaking change (see
-// shario's own info/PLUGIN_SPECIFICATIONS.md).
-const COMPATIBLE_SHARIO_TAG = 'shario_v0.1.0_beta4';
+// The newest MAJOR shario release line this extension version is
+// built/tested against. Bump this (and publish a new extension version)
+// when shario ships a breaking (MAJOR-bumped) release this extension
+// should follow instead -- see shario's own info/PLUGIN_SPECIFICATIONS.md
+// for what a MAJOR bump means. Anything within this major (a minor/patch
+// release) is picked up automatically -- see resolveTargetTag -- without
+// needing an extension update at all.
+const COMPATIBLE_SHARIO_MAJOR = 0;
 
-// What ensureSharBinary actually downloads/runs. Starts at this extension's
-// own pin every session; the "Shar: Update Server Binary" command can move
-// it for the rest of this session (not persisted -- an old manual override
-// shouldn't silently outlive the session you chose it in, and updating the
-// extension should always win).
-let activeVersion = COMPATIBLE_SHARIO_TAG;
+// Set only by the "Shar: Update Server Binary" command, when the user
+// explicitly forces a specific release, possibly a different major than
+// COMPATIBLE_SHARIO_MAJOR. null means "resolve normally" -- the newest
+// release matching COMPATIBLE_SHARIO_MAJOR, re-checked every time a binary
+// is needed. Deliberately not persisted across sessions -- an old manual
+// override shouldn't silently outlive the session you chose it in.
+let activeVersionOverride = null;
 
 // set once in activate() -- needed to resolve a per-extension storage
 // directory to cache the downloaded shario binary in
@@ -192,11 +193,12 @@ function activate(context) {
         outputChannel.appendLine(`Joined Shar session: "${name.trim()}"`);
     });
 
-    // Checks GitHub for the newest shario release and downloads it, warning
-    // first if its major version differs from what this extension is
-    // pinned to (COMPATIBLE_SHARIO_TAG) -- that's this project's own signal
-    // for "likely incompatible," not something this extension can verify
-    // for real, since there's no version handshake in the wire protocol.
+    // Checks GitHub for the newest shario release overall (unlike the
+    // normal automatic resolution, not constrained to
+    // COMPATIBLE_SHARIO_MAJOR) and downloads it, warning first if its major
+    // version differs -- that's this project's own signal for "likely
+    // incompatible," not something this extension can verify for real,
+    // since there's no version handshake in the wire protocol.
     const updateCmd = vscode.commands.registerCommand('shar.updateServer', async () => {
         const enableBeta = vscode.workspace.getConfiguration('shario').get('enableBeta', false);
         let latestTag;
@@ -207,19 +209,19 @@ function activate(context) {
             return;
         }
 
-        if (parseMajor(latestTag) !== parseMajor(activeVersion)) {
+        if (parseMajor(latestTag) !== COMPATIBLE_SHARIO_MAJOR) {
             const choice = await vscode.window.showWarningMessage(
-                `Latest shario release (${latestTag}) has a different major version than what this extension expects (${activeVersion}) -- likely a breaking change.`,
+                `Latest shario release (${latestTag}) has a different major version than what this extension expects (major ${COMPATIBLE_SHARIO_MAJOR}) -- likely a breaking change.`,
                 { modal: true },
                 'Update anyway',
             );
             if (choice !== 'Update anyway') return;
         }
 
-        activeVersion = latestTag;
+        activeVersionOverride = latestTag;
         outputChannel.appendLine(`Updating to ${latestTag}...`);
         try {
-            await ensureSharBinary();
+            await ensureSharBinary(enableBeta);
             vscode.window.showInformationMessage(
                 `Downloaded ${latestTag} -- will be used next time the server (re)starts.`,
             );
@@ -565,15 +567,68 @@ function downloadFile(url, dest) {
     });
 }
 
-// Returns a local path to a working shario binary matching `activeVersion`,
-// downloading it the first time this version is needed on this machine.
+// Parses the MAJOR component out of a `shario_vMAJOR.MINOR.PATCH` tag.
+function parseMajor(tag) {
+    const match = tag.match(/^shario_v(\d+)\./);
+    return match ? parseInt(match[1], 10) : null;
+}
+
+// Fetches this project's releases, newest first, filtered to stable-only
+// unless `enableBeta` is set (shario.enableBeta) -- this project marks
+// test/beta releases as pre-release on purpose, so plain usage should
+// never pick one up unless explicitly opted into.
+function fetchReleases(enableBeta) {
+    return new Promise((resolve, reject) => {
+        const options = { headers: { 'User-Agent': 'shario-vscode' } };
+        https
+            .get(`https://api.github.com/repos/${GITHUB_REPO}/releases`, options, (res) => {
+                let body = '';
+                res.on('data', (chunk) => (body += chunk));
+                res.on('end', () => {
+                    try {
+                        const parsed = JSON.parse(body);
+                        if (!Array.isArray(parsed)) {
+                            reject(new Error("GitHub's response wasn't a release list"));
+                            return;
+                        }
+                        resolve(enableBeta ? parsed : parsed.filter((r) => !r.prerelease));
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
+            })
+            .on('error', reject);
+    });
+}
+
+// The tag ensureSharBinary should actually use: whatever the "Shar: Update
+// Server Binary" command explicitly forced, if anything, or else the
+// newest release matching COMPATIBLE_SHARIO_MAJOR -- resolved fresh every
+// time so a new compatible minor/patch release is always picked up without
+// needing an extension update, while a differently-majored release is
+// never used automatically.
+async function resolveTargetTag(enableBeta) {
+    if (activeVersionOverride) {
+        return activeVersionOverride;
+    }
+    const releases = await fetchReleases(enableBeta);
+    const match = releases.find((r) => parseMajor(r.tag_name) === COMPATIBLE_SHARIO_MAJOR);
+    if (!match) {
+        throw new Error(`No shario release found matching major version ${COMPATIBLE_SHARIO_MAJOR}`);
+    }
+    return match.tag_name;
+}
+
+// Returns a local path to a working shario binary (see resolveTargetTag),
+// downloading it the first time that version is needed on this machine.
 // Cached one subfolder per version under VS Code's own per-extension
-// storage directory (not the workspace), so switching versions (see
-// the "Shar: Update Server Binary" command) never re-downloads one already
-// fetched before, and never clobbers another version's cached copy.
-async function ensureSharBinary() {
+// storage directory (not the workspace), so a version already fetched
+// before is never re-downloaded, and never clobbers another version's
+// cached copy.
+async function ensureSharBinary(enableBeta) {
+    const targetTag = await resolveTargetTag(enableBeta);
     const assetName = binaryAssetName();
-    const binDir = path.join(extensionContext.globalStorageUri.fsPath, 'bin', activeVersion);
+    const binDir = path.join(extensionContext.globalStorageUri.fsPath, 'bin', targetTag);
     const binPath = path.join(binDir, assetName);
 
     if (fs.existsSync(binPath)) {
@@ -581,8 +636,8 @@ async function ensureSharBinary() {
     }
 
     fs.mkdirSync(binDir, { recursive: true });
-    const url = `https://github.com/${GITHUB_REPO}/releases/download/${activeVersion}/${assetName}`;
-    outputChannel.appendLine(`Downloading shario binary (${activeVersion}) from ${url}...`);
+    const url = `https://github.com/${GITHUB_REPO}/releases/download/${targetTag}/${assetName}`;
+    outputChannel.appendLine(`Downloading shario binary (${targetTag}) from ${url}...`);
     await downloadFile(url, binPath);
 
     if (process.platform !== 'win32') {
@@ -593,53 +648,17 @@ async function ensureSharBinary() {
     return binPath;
 }
 
-// Parses the MAJOR component out of a `shario_vMAJOR.MINOR.PATCH` tag.
-function parseMajor(tag) {
-    const match = tag.match(/^shario_v(\d+)\./);
-    return match ? parseInt(match[1], 10) : null;
-}
-
-// Asks GitHub for the actual newest shario release (not just the asset
-// redirect used elsewhere) -- needed here since the update command has to
-// compare version *numbers*, not just fetch a file.
-//
-// By default this uses /releases/latest, which excludes anything marked
-// pre-release (this project marks test/beta releases as pre-release on
-// purpose) -- so this never auto-updates a plugin onto one unless the user
-// explicitly opted in via the `shario.enableBeta` setting, in which case it
-// uses the plain /releases list (newest first, including pre-releases)
-// instead and just takes the first entry.
-function fetchLatestReleaseTag(enableBeta) {
-    const url = enableBeta
-        ? `https://api.github.com/repos/${GITHUB_REPO}/releases`
-        : `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
-
-    return new Promise((resolve, reject) => {
-        const options = { headers: { 'User-Agent': 'shario-vscode' } };
-        https
-            .get(url, options, (res) => {
-                let body = '';
-                res.on('data', (chunk) => (body += chunk));
-                res.on('end', () => {
-                    if (res.statusCode === 404) {
-                        reject(new Error('No stable shario release has been published yet'));
-                        return;
-                    }
-                    try {
-                        const parsed = JSON.parse(body);
-                        const release = enableBeta ? parsed[0] : parsed;
-                        if (!release || !release.tag_name) {
-                            reject(new Error(enableBeta ? 'No shario releases exist yet' : "GitHub's response had no tag_name"));
-                            return;
-                        }
-                        resolve(release.tag_name);
-                    } catch (err) {
-                        reject(err);
-                    }
-                });
-            })
-            .on('error', reject);
-    });
+// Finds the actual newest release regardless of major version -- unlike
+// resolveTargetTag, not constrained to COMPATIBLE_SHARIO_MAJOR, since this
+// is the one place a major-crossing update can happen, and only with the
+// user's explicit confirmation (see the "Shar: Update Server Binary"
+// command handler).
+async function fetchLatestReleaseTag(enableBeta) {
+    const releases = await fetchReleases(enableBeta);
+    if (!releases[0]) {
+        throw new Error('No shario releases found');
+    }
+    return releases[0].tag_name;
 }
 
 // Starts the shar server as a child process, downloading a prebuilt binary
@@ -658,9 +677,10 @@ async function startSharProcess() {
         return false;
     }
 
+    const enableBeta = vscode.workspace.getConfiguration('shario').get('enableBeta', false);
     let binPath;
     try {
-        binPath = await ensureSharBinary();
+        binPath = await ensureSharBinary(enableBeta);
     } catch (err) {
         vscode.window.showErrorMessage(`Failed to obtain Shar binary: ${err.message}`);
         return false;

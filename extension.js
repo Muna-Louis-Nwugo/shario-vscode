@@ -37,15 +37,55 @@ const { io } = require('socket.io-client');
 const { spawn } = require('child_process');
 const net = require('net');
 const path = require('path');
+const fs = require('fs');
+const https = require('https');
+
+const GITHUB_REPO = 'Muna-Louis-Nwugo/shario';
+
+// The exact shario release this extension version is built/tested against.
+// Bump this (and publish a new extension version) when shario ships a
+// release this extension should follow -- that bump is itself what makes
+// updating the extension also fetch the new server version, since the
+// binary cache is keyed by this tag (see ensureSharBinary). Releases are
+// `shario_vMAJOR.MINOR.PATCH`; a MAJOR bump means a breaking change (see
+// shario's own info/PLUGIN_SPECIFICATIONS.md).
+const COMPATIBLE_SHARIO_TAG = 'shario_v0.1.0_beta4';
+
+// What ensureSharBinary actually downloads/runs. Starts at this extension's
+// own pin every session; the "Shar: Update Server Binary" command can move
+// it for the rest of this session (not persisted -- an old manual override
+// shouldn't silently outlive the session you chose it in, and updating the
+// extension should always win).
+let activeVersion = COMPATIBLE_SHARIO_TAG;
+
+// set once in activate() -- needed to resolve a per-extension storage
+// directory to cache the downloaded shario binary in
+let extensionContext = null;
 
 // the shar server process, if this extension is the one that (re)started it
 // -- null if the user launched it themselves, in which case we don't own its
 // lifecycle and won't try to restart it
 let sharProcess = null;
 
-// assumes the dev layout: shario-vscode and shario are sibling directories
-// under the same parent. Update this if that ever changes.
-const SHAR_DIR = path.resolve(__dirname, '..', 'shario');
+// the exact subcommand/args shario was launched with (e.g. ['create', name]
+// or ['participate', name]) -- maybeRestartServer needs this to rejoin the
+// same session on an unexpected restart, not silently start a fresh one
+let lastLaunchArgs = null;
+
+const SESSION_NAME_WORDS = [
+    'quick', 'lazy', 'brave', 'calm', 'eager', 'fuzzy', 'gentle', 'jolly',
+    'proud', 'silly', 'witty', 'bold', 'otter', 'falcon', 'maple', 'comet',
+    'badger', 'willow', 'ember', 'puzzle', 'raven', 'cedar', 'harbor', 'thistle',
+];
+
+// A plugin that wants to guarantee it knows a session's name (to show the
+// user) shouldn't ever rely on the server's own random fallback -- generate
+// it here instead, so it's always known up front, and always pass it to
+// `create` explicitly.
+function randomSessionName() {
+    const pick = () => SESSION_NAME_WORDS[Math.floor(Math.random() * SESSION_NAME_WORDS.length)];
+    return `${pick()}-${pick()}-${pick()}`;
+}
 
 // socket persists across commands -- one connection per VS Code session
 let socket = null;
@@ -95,87 +135,96 @@ const pendingSnapshots = new Map();
 let nextTag = 0;
 
 function activate(context) {
+    extensionContext = context;
     outputChannel = vscode.window.createOutputChannel('Shar');
 
-    const connectCmd = vscode.commands.registerCommand('shar.connect', async () => {
-        if (socket && socket.connected) {
-            vscode.window.showInformationMessage('Already connected to Shar');
+    // Attaches to a shar server already running (e.g. one still alive from a
+    // previous VS Code session). Does not launch anything itself -- see
+    // `shar.create`/`shar.participate` below for the normal entry points.
+    const connectCmd = vscode.commands.registerCommand('shar.connect', connectAndJoin);
+
+    const createCmd = vscode.commands.registerCommand('shar.create', async () => {
+        const typed = await vscode.window.showInputBox({
+            prompt: 'Name this Shar session (leave blank for a random name)',
+            placeHolder: 'e.g. my-team-project',
+        });
+        if (typed === undefined) return; // cancelled (Escape)
+
+        const name = typed.trim() || randomSessionName();
+        lastLaunchArgs = ['create', name];
+
+        if (!(await startSharProcess())) return; // error already shown
+        if (!(await waitForServerUp(30000))) {
+            vscode.window.showErrorMessage('Shar server did not come up in time -- check the Shar output channel.');
+            return;
+        }
+        await connectAndJoin();
+
+        // the name is the one piece of info another person needs to
+        // "Participate" in this same session -- notifications auto-dismiss,
+        // so it also goes in the output channel where it won't get missed
+        outputChannel.appendLine(`Shar session created: "${name}"`);
+        const choice = await vscode.window.showInformationMessage(
+            `Shar session created: "${name}" — share this name so others can join.`,
+            'Copy Name',
+        );
+        if (choice === 'Copy Name') {
+            await vscode.env.clipboard.writeText(name);
+        }
+    });
+
+    const participateCmd = vscode.commands.registerCommand('shar.participate', async () => {
+        const name = await vscode.window.showInputBox({
+            prompt: 'Name of the Shar session to join',
+            placeHolder: 'the exact name the session was created with',
+            validateInput: (v) => (v.trim() ? undefined : 'A session name is required'),
+        });
+        if (!name) return; // cancelled or left blank
+
+        lastLaunchArgs = ['participate', name.trim()];
+
+        if (!(await startSharProcess())) return; // error already shown
+        if (!(await waitForServerUp(30000))) {
+            vscode.window.showErrorMessage('Shar server did not come up in time -- check the Shar output channel.');
+            return;
+        }
+        await connectAndJoin();
+        outputChannel.appendLine(`Joined Shar session: "${name.trim()}"`);
+    });
+
+    // Checks GitHub for the newest shario release and downloads it, warning
+    // first if its major version differs from what this extension is
+    // pinned to (COMPATIBLE_SHARIO_TAG) -- that's this project's own signal
+    // for "likely incompatible," not something this extension can verify
+    // for real, since there's no version handshake in the wire protocol.
+    const updateCmd = vscode.commands.registerCommand('shar.updateServer', async () => {
+        let latestTag;
+        try {
+            latestTag = await fetchLatestReleaseTag();
+        } catch (err) {
+            vscode.window.showErrorMessage(`Failed to check for updates: ${err.message}`);
             return;
         }
 
-        const folders = vscode.workspace.workspaceFolders;
-        if (!folders || folders.length === 0) {
-            vscode.window.showErrorMessage('Open a workspace folder before connecting to Shar.');
-            return;
+        if (parseMajor(latestTag) !== parseMajor(activeVersion)) {
+            const choice = await vscode.window.showWarningMessage(
+                `Latest shario release (${latestTag}) has a different major version than what this extension expects (${activeVersion}) -- likely a breaking change.`,
+                { modal: true },
+                'Update anyway',
+            );
+            if (choice !== 'Update anyway') return;
         }
-        connectedRoot = folders[0].uri.fsPath;
 
-        // io() opens a Socket.IO connection to the Shar server. Socket.IO sits
-        // on top of WebSockets and handles reconnection, namespaces, and
-        // rooms -- your server uses the "/" namespace by default
-        socket = io('http://127.0.0.1:3000');
-
-        // 'connect' fires every time the transport handshake completes --
-        // the first connect and any automatic reconnect socket.io does on
-        // its own. The shar reads file contents from disk, not from open
-        // editor buffers, so unsaved changes are flushed right before each
-        // and every one of those, not just the first: whatever the server
-        // is about to load (or reload) needs to match what's open. `false`
-        // skips untitled files, which have no disk path to save to anyway.
-        socket.on('connect', async () => {
-            await vscode.workspace.saveAll(false);
-
-            socket.emit('join', { local: true, path: connectedRoot });
-            vscode.window.showInformationMessage('Connected to Shar');
-            outputChannel.appendLine(`Connected to Shar server, joined as local for ${connectedRoot}`);
-
-            // seed local state with whatever's already open, so the very
-            // first edit in each has something to work against
-            for (const doc of vscode.workspace.textDocuments) {
-                if (isTrackedDocument(doc)) {
-                    getOrCreateLines(doc);
-                }
-            }
-        });
-
-        socket.on('disconnect', () => {
-            vscode.window.showWarningMessage('Disconnected from Shar');
-            outputChannel.appendLine('Disconnected from Shar server');
-            maybeRestartServer();
-        });
-
-        // NOT YET SENT BY THE SERVER -- see the file-level comment.
-        socket.on('ide-add-confirmed', (data) => {
-            const pending = pendingAdds.get(data.tag);
-            if (!pending) return;
-            pendingAdds.delete(data.tag);
-            pending.id = data.id;
-            pending.peer = data.peer;
-            pending.tag = null;
-
-            const waiting = pendingRemovals.get(data.tag);
-            if (waiting) {
-                pendingRemovals.delete(data.tag);
-                emitRemove(waiting.filePath, waiting.row, waiting.col, waiting.isWholeLine, pending.id, pending.peer);
-            }
-        });
-
-        // NOT YET SENT BY THE SERVER -- see the file-level comment. Fills in
-        // real (id, peer) for pre-existing content, matching by position:
-        // that's only safe here because nothing has been edited since the
-        // moment this client saved and the server loaded the same bytes off
-        // disk, which is exactly when this event fires.
-        socket.on('initial-state', (data) => {
-            const doc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === data.file_path);
-            const key = doc && doc.uri.toString();
-            if (key && docState.has(key)) {
-                reconcileIdentities(docState.get(key), data.lines);
-            } else {
-                // not open yet, or docState for it hasn't been built --
-                // getOrCreateLines picks this up once it is
-                pendingSnapshots.set(data.file_path, data.lines);
-            }
-        });
+        activeVersion = latestTag;
+        outputChannel.appendLine(`Updating to ${latestTag}...`);
+        try {
+            await ensureSharBinary();
+            vscode.window.showInformationMessage(
+                `Downloaded ${latestTag} -- will be used next time the server (re)starts.`,
+            );
+        } catch (err) {
+            vscode.window.showErrorMessage(`Failed to download ${latestTag}: ${err.message}`);
+        }
     });
 
     const changeListener = vscode.workspace.onDidChangeTextDocument((event) => {
@@ -192,7 +241,92 @@ function activate(context) {
 
     // pushing to subscriptions ensures VS Code disposes these when the
     // extension deactivates -- prevents leaked listeners/connections
-    context.subscriptions.push(connectCmd, changeListener);
+    context.subscriptions.push(connectCmd, createCmd, participateCmd, updateCmd, changeListener);
+}
+
+// Opens the socket.io connection and joins as local for the current
+// workspace folder. Shared by `shar.connect` (attach to an already-running
+// server) and `shar.create`/`shar.participate` (which spawn the server
+// first, then call this once it's up).
+async function connectAndJoin() {
+    if (socket && socket.connected) {
+        vscode.window.showInformationMessage('Already connected to Shar');
+        return;
+    }
+
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length === 0) {
+        vscode.window.showErrorMessage('Open a workspace folder before connecting to Shar.');
+        return;
+    }
+    connectedRoot = folders[0].uri.fsPath;
+
+    // io() opens a Socket.IO connection to the Shar server. Socket.IO sits
+    // on top of WebSockets and handles reconnection, namespaces, and
+    // rooms -- your server uses the "/" namespace by default
+    socket = io('http://127.0.0.1:3000');
+
+    // 'connect' fires every time the transport handshake completes --
+    // the first connect and any automatic reconnect socket.io does on
+    // its own. The shar reads file contents from disk, not from open
+    // editor buffers, so unsaved changes are flushed right before each
+    // and every one of those, not just the first: whatever the server
+    // is about to load (or reload) needs to match what's open. `false`
+    // skips untitled files, which have no disk path to save to anyway.
+    socket.on('connect', async () => {
+        await vscode.workspace.saveAll(false);
+
+        socket.emit('join', { local: true, path: connectedRoot });
+        vscode.window.showInformationMessage('Connected to Shar');
+        outputChannel.appendLine(`Connected to Shar server, joined as local for ${connectedRoot}`);
+
+        // seed local state with whatever's already open, so the very
+        // first edit in each has something to work against
+        for (const doc of vscode.workspace.textDocuments) {
+            if (isTrackedDocument(doc)) {
+                getOrCreateLines(doc);
+            }
+        }
+    });
+
+    socket.on('disconnect', () => {
+        vscode.window.showWarningMessage('Disconnected from Shar');
+        outputChannel.appendLine('Disconnected from Shar server');
+        maybeRestartServer();
+    });
+
+    // NOT YET SENT BY THE SERVER -- see the file-level comment.
+    socket.on('ide-add-confirmed', (data) => {
+        const pending = pendingAdds.get(data.tag);
+        if (!pending) return;
+        pendingAdds.delete(data.tag);
+        pending.id = data.id;
+        pending.peer = data.peer;
+        pending.tag = null;
+
+        const waiting = pendingRemovals.get(data.tag);
+        if (waiting) {
+            pendingRemovals.delete(data.tag);
+            emitRemove(waiting.filePath, waiting.row, waiting.col, waiting.isWholeLine, pending.id, pending.peer);
+        }
+    });
+
+    // NOT YET SENT BY THE SERVER -- see the file-level comment. Fills in
+    // real (id, peer) for pre-existing content, matching by position:
+    // that's only safe here because nothing has been edited since the
+    // moment this client saved and the server loaded the same bytes off
+    // disk, which is exactly when this event fires.
+    socket.on('initial-state', (data) => {
+        const doc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === data.file_path);
+        const key = doc && doc.uri.toString();
+        if (key && docState.has(key)) {
+            reconcileIdentities(docState.get(key), data.lines);
+        } else {
+            // not open yet, or docState for it hasn't been built --
+            // getOrCreateLines picks this up once it is
+            pendingSnapshots.set(data.file_path, data.lines);
+        }
+    });
 }
 
 function isTrackedDocument(doc) {
@@ -379,7 +513,7 @@ function emitRemove(filePath, row, col, isWholeLine, id, peer) {
 async function maybeRestartServer() {
     if (await isServerUp()) return; // still alive -- not what killed the connection
     outputChannel.appendLine('Shar server appears to have died -- attempting to restart it...');
-    if (!startSharProcess()) return; // error already shown
+    if (!(await startSharProcess())) return; // error already shown
 
     const up = await waitForServerUp(30000);
     if (up) {
@@ -389,15 +523,142 @@ async function maybeRestartServer() {
     }
 }
 
-// Starts the shar server as a child process via `cargo run` (rebuilds
-// automatically if the code changed). Returns false (after showing an error)
-// if spawning itself failed; true otherwise.
-function startSharProcess() {
+// Maps this machine's platform/arch to the exact release asset name built by
+// shario's own .github/workflows/release.yml -- see info/PLUGIN_SPECIFICATIONS.md
+// (in the shario repo) for the full table.
+function binaryAssetName() {
+    const { platform, arch } = process;
+    if (platform === 'win32' && arch === 'x64') return 'shario-windows-x64.exe';
+    if (platform === 'win32' && arch === 'arm64') return 'shario-windows-arm64.exe';
+    if (platform === 'darwin' && arch === 'arm64') return 'shario-macos-arm64';
+    if (platform === 'darwin' && arch === 'x64') return 'shario-macos-x64';
+    if (platform === 'linux' && arch === 'x64') return 'shario-linux-x64';
+    if (platform === 'linux' && arch === 'arm64') return 'shario-linux-arm64';
+    throw new Error(`No prebuilt shario binary for ${platform}/${arch}`);
+}
+
+// Downloads `url` to `dest`, following redirects -- GitHub's own
+// releases/latest/download links are themselves a redirect to the real,
+// versioned asset URL, not something https.get follows automatically.
+function downloadFile(url, dest) {
+    return new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(dest);
+        https
+            .get(url, (res) => {
+                if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    file.close();
+                    fs.unlink(dest, () => downloadFile(res.headers.location, dest).then(resolve, reject));
+                    return;
+                }
+                if (res.statusCode !== 200) {
+                    file.close();
+                    fs.unlink(dest, () => reject(new Error(`Download failed: HTTP ${res.statusCode}`)));
+                    return;
+                }
+                res.pipe(file);
+                file.on('finish', () => file.close(resolve));
+            })
+            .on('error', (err) => {
+                fs.unlink(dest, () => reject(err));
+            });
+    });
+}
+
+// Returns a local path to a working shario binary matching `activeVersion`,
+// downloading it the first time this version is needed on this machine.
+// Cached one subfolder per version under VS Code's own per-extension
+// storage directory (not the workspace), so switching versions (see
+// the "Shar: Update Server Binary" command) never re-downloads one already
+// fetched before, and never clobbers another version's cached copy.
+async function ensureSharBinary() {
+    const assetName = binaryAssetName();
+    const binDir = path.join(extensionContext.globalStorageUri.fsPath, 'bin', activeVersion);
+    const binPath = path.join(binDir, assetName);
+
+    if (fs.existsSync(binPath)) {
+        return binPath;
+    }
+
+    fs.mkdirSync(binDir, { recursive: true });
+    const url = `https://github.com/${GITHUB_REPO}/releases/download/${activeVersion}/${assetName}`;
+    outputChannel.appendLine(`Downloading shario binary (${activeVersion}) from ${url}...`);
+    await downloadFile(url, binPath);
+
+    if (process.platform !== 'win32') {
+        fs.chmodSync(binPath, 0o755);
+    }
+
+    outputChannel.appendLine(`Downloaded shario binary to ${binPath}`);
+    return binPath;
+}
+
+// Parses the MAJOR component out of a `shario_vMAJOR.MINOR.PATCH` tag.
+function parseMajor(tag) {
+    const match = tag.match(/^shario_v(\d+)\./);
+    return match ? parseInt(match[1], 10) : null;
+}
+
+// Asks GitHub for the actual newest *stable* shario release (not just the
+// asset redirect used elsewhere) -- needed here since the update command has
+// to compare version *numbers*, not just fetch a file. Deliberately uses
+// /releases/latest, not the plain /releases list -- pre-releases are
+// intentionally excluded (this project marks test/beta releases as
+// pre-release on purpose), so this must never auto-update a plugin onto one.
+function fetchLatestReleaseTag() {
+    return new Promise((resolve, reject) => {
+        const options = { headers: { 'User-Agent': 'shario-vscode' } };
+        https
+            .get(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`, options, (res) => {
+                let body = '';
+                res.on('data', (chunk) => (body += chunk));
+                res.on('end', () => {
+                    if (res.statusCode === 404) {
+                        reject(new Error('No stable shario release has been published yet'));
+                        return;
+                    }
+                    try {
+                        const parsed = JSON.parse(body);
+                        if (!parsed.tag_name) {
+                            reject(new Error("GitHub's response had no tag_name"));
+                            return;
+                        }
+                        resolve(parsed.tag_name);
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
+            })
+            .on('error', reject);
+    });
+}
+
+// Starts the shar server as a child process, downloading a prebuilt binary
+// first if one isn't already cached locally. Reuses whatever `lastLaunchArgs`
+// was set to by `shar.create`/`shar.participate` -- so a restart rejoins the
+// same session instead of needing a subcommand to default to. Returns false
+// (after showing an error) if obtaining/spawning the binary failed, or if
+// there's no session to relaunch into yet; true otherwise.
+async function startSharProcess() {
     if (sharProcess) return true; // already (re)started by us this session
 
-    outputChannel.appendLine(`Launching Shar server via "cargo run" in ${SHAR_DIR}`);
+    if (!lastLaunchArgs) {
+        vscode.window.showErrorMessage(
+            'Shar: no session to start -- use "Shar: Create Session" or "Shar: Participate in Session" first.',
+        );
+        return false;
+    }
+
+    let binPath;
     try {
-        sharProcess = spawn('cargo', ['run'], { cwd: SHAR_DIR });
+        binPath = await ensureSharBinary();
+    } catch (err) {
+        vscode.window.showErrorMessage(`Failed to obtain Shar binary: ${err.message}`);
+        return false;
+    }
+
+    outputChannel.appendLine(`Launching Shar server via "${binPath} ${lastLaunchArgs.join(' ')}"`);
+    try {
+        sharProcess = spawn(binPath, lastLaunchArgs);
     } catch (err) {
         vscode.window.showErrorMessage(`Failed to launch Shar server: ${err.message}`);
         return false;

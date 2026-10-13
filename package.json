@@ -10,8 +10,20 @@
   "contributes": {
     "commands": [
       {
+        "command": "shar.create",
+        "title": "Shar: Create Session"
+      },
+      {
+        "command": "shar.participate",
+        "title": "Shar: Participate in Session"
+      },
+      {
         "command": "shar.connect",
-        "title": "Shar: Connect"
+        "title": "Shar: Connect (attach to an already-running server)"
+      },
+      {
+        "command": "shar.updateServer",
+        "title": "Shar: Update Server Binary"
       }
     ]
   },

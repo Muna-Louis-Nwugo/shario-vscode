@@ -24,6 +24,10 @@
       {
         "command": "shar.updateServer",
         "title": "Shar: Update Server Binary"
+      },
+      {
+        "command": "shar.disconnect",
+        "title": "Shar: Disconnect"
       }
     ],
     "configuration": {

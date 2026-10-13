@@ -230,6 +230,31 @@ function activate(context) {
         }
     });
 
+    // Ends the current session: disconnects the socket, and kills the
+    // server process if this extension is the one that (re)started it --
+    // same ownership rule deactivate() already follows, just invokable on
+    // demand instead of only on VS Code shutdown. Clears lastLaunchArgs too,
+    // so a later unexpected "disconnect" event can't auto-restart a session
+    // that was deliberately ended.
+    const disconnectCmd = vscode.commands.registerCommand('shar.disconnect', () => {
+        if (!socket && !sharProcess) {
+            vscode.window.showInformationMessage('Not connected to Shar');
+            return;
+        }
+        if (socket) {
+            socket.disconnect();
+            socket = null;
+        }
+        if (sharProcess) {
+            sharProcess.kill();
+            sharProcess = null;
+        }
+        connectedRoot = null;
+        lastLaunchArgs = null;
+        outputChannel.appendLine('Disconnected from Shar');
+        vscode.window.showInformationMessage('Disconnected from Shar');
+    });
+
     const changeListener = vscode.workspace.onDidChangeTextDocument((event) => {
         const doc = event.document;
         if (!socket || !socket.connected) return;
@@ -244,7 +269,7 @@ function activate(context) {
 
     // pushing to subscriptions ensures VS Code disposes these when the
     // extension deactivates -- prevents leaked listeners/connections
-    context.subscriptions.push(connectCmd, createCmd, participateCmd, updateCmd, changeListener);
+    context.subscriptions.push(connectCmd, createCmd, participateCmd, updateCmd, disconnectCmd, changeListener);
 }
 
 // Opens the socket.io connection and joins as local for the current

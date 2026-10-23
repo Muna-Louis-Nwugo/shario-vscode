@@ -2,28 +2,39 @@
  * TESTING INSTRUCTIONS
  * WSL run "code ."
  * hit f5
- * CTRL + Shift + P
+ * CTRL + Shift + P5
  * run "Shar: Connect" (make sure your shar server is already running and the
  * connected workspace folder matches the directory the server loaded)
  * then just type/delete in a file that's part of that shar
  *
- * This client is send-only: it forwards every keystroke as an "ide-add"/
- * "remove" event, and does nothing with anything the server sends back
- * (no "network-add"/"network-remove" handling yet -- that's a later pass,
- * once the server side reports back where a remote op actually landed).
+ * This client forwards every keystroke as an "ide-add"/"remove" event, and
+ * applies "network-add"/"network-remove" (another peer's edits, already
+ * confirmed server-side) to this editor's own buffer -- see
+ * `applyNetworkAdd`/`applyNetworkRemove`. Both directions resolve a
+ * character by identity (id, peer), never by position. A "network-add"'s
+ * parent is already the real immediate predecessor in rendered order (the
+ * server resolves sibling tie-break itself, see queue.rs's
+ * `add_network_operation_inner`), so this client never has to re-derive
+ * ordering -- it just inserts right after whatever identity it's given. A
+ * remote op naming a parent/target this client has never seen (most often
+ * because it was already removed; this client only keeps live cells, never
+ * tombstones) is dropped, not guessed.
  *
  * Pre-existing content (loaded from disk before this client connects) gets
- * its real (id, peer) filled in by an "initial-state" event the server is
- * expected to send once, right after "join" -- see `reconcileIdentities`.
- * NOT YET SENT BY THE SERVER: until that event exists, deleting
- * pre-existing content sends `id: null, peer: null`, which the server
- * can't resolve. Only characters typed after connecting (which get a real
- * identity via "ide-add-confirmed") can be removed correctly today.
+ * its real (id, peer) filled in by an "initial-state" event the server
+ * sends once, right after "join" -- see `reconcileIdentities`. Two peers
+ * joining with genuinely different starting documents isn't handled yet
+ * (see the shar repo's info/TODO.md on catch-up duplication) -- not solved
+ * by blindly scrapping local content, which silently destroys real local
+ * work whenever there's nothing actually wrong with it (e.g. plain
+ * `shar.create`/`shar.connect`, where this client's own content *is* what
+ * the server just loaded).
  *
  * Expected "initial-state" payload: `{ file_path, lines }`, where `lines`
  * mirrors the server's own per-line projection -- one array per line, each
- * entry a raw `[id, peer]` pair, with index 0 being that line's anchor (the
- * root sentinel for line 0, the creating newline for every other line).
+ * entry a raw `[id, peer, value]` triple (this client only uses the first
+ * two), with index 0 being that line's anchor (the root sentinel for line
+ * 0, the creating newline for every other line).
  *
  * A large burst of adds/deletes used to be able to crash the server (a
  * position-based parent reference could permanently orphan a character
@@ -257,6 +268,7 @@ function activate(context) {
 
     const changeListener = vscode.workspace.onDidChangeTextDocument((event) => {
         const doc = event.document;
+        if (applyingRemoteEdit) return; // our own edit, not new local typing -- see applyBufferEdit
         if (!socket || !socket.connected) return;
         if (!isTrackedDocument(doc)) return;
 
@@ -355,6 +367,25 @@ async function connectAndJoin() {
             pendingSnapshots.set(data.file_path, data.lines);
         }
     });
+
+    // A remote peer's edit, already applied and confirmed server-side.
+    // `file_path` here is already this replica's own absolute path by the
+    // time it reaches us -- NetworkAdd/Remove travel relative between
+    // *servers*, but SharQueue resolves that back to a local absolute path
+    // (`to_local_path`) before this callback ever fires, same as
+    // "initial-state"'s own `file_path`. Confirmed directly against a real
+    // two-server gossip run, not just read off queue.rs.
+    socket.on('network-add', async (data) => {
+        const doc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === data.file_path);
+        if (!doc) return; // not open here -- nothing to render it into
+        await applyNetworkAdd(doc, getOrCreateLines(doc), data);
+    });
+
+    socket.on('network-remove', async (data) => {
+        const doc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === data.file_path);
+        if (!doc) return;
+        await applyNetworkRemove(doc, getOrCreateLines(doc), data);
+    });
 }
 
 function isTrackedDocument(doc) {
@@ -366,10 +397,11 @@ function isTrackedDocument(doc) {
 // this is pre-existing content, so its real (id, peer) isn't known yet and
 // has to wait on "initial-state" (see `getOrCreateLines`/`reconcileIdentities`).
 function buildInitialState(text) {
-    return text.split('\n').map((line, i) => ({
-        anchor: i === 0 ? { id: 0, peer: 0, tag: null } : { id: null, peer: null, tag: null },
-        cells: [...line].map((value) => ({ value, id: null, peer: null, tag: null })),
-    }));
+    return text.split('\n').map((line, i) => {
+        const anchor = i === 0 ? { id: 0, peer: 0, tag: null } : { id: null, peer: null, tag: null };
+        const cells = [...line].map((value) => ({ value, id: null, peer: null, tag: null }));
+        return { anchor, cells };
+    });
 }
 
 // Returns `doc`'s local mirror, building it (and applying any "initial-state"
@@ -395,8 +427,11 @@ function getOrCreateLines(doc) {
 // Fills in real (id, peer) for pre-existing content from the server's
 // "initial-state" snapshot, matching purely by position -- see the comment
 // on the "initial-state" handler for why that's safe here specifically.
-// Each entry is a raw `[id, peer]` pair (the server just serializes its own
-// (IdSize, PeerIdSize) tuples), not an `{ id, peer }` object.
+// Each entry is a raw `[id, peer, value]` triple now (the server also sends
+// the real character, for clients -- like the remote-debug-peer.yml test
+// script -- that have no local content of their own to trust), but this
+// client already has real values from its own open buffer, so it only ever
+// uses the first two elements.
 function reconcileIdentities(lines, serverLines) {
     for (let i = 0; i < serverLines.length && i < lines.length; i++) {
         const [anchorInfo, ...cellInfos] = serverLines[i];
@@ -530,6 +565,120 @@ function emitRemove(filePath, row, col, isWholeLine, id, peer) {
     };
     socket.emit('remove', payload);
     outputChannel.appendLine(`remove: ${JSON.stringify(payload)}`);
+}
+
+// Set while this extension is itself applying a remote edit to a buffer --
+// `onDidChangeTextDocument` checks this to avoid re-sending someone else's
+// edit back to the server as if it were new local typing.
+let applyingRemoteEdit = false;
+
+async function applyBufferEdit(doc, apply) {
+    const edit = new vscode.WorkspaceEdit();
+    apply(edit, doc.uri);
+    applyingRemoteEdit = true;
+    try {
+        await vscode.workspace.applyEdit(edit);
+    } finally {
+        applyingRemoteEdit = false;
+    }
+}
+
+// Finds `id`/`peer`'s current position in `lines`, as either a line's own
+// anchor or a cell. `null` if not found -- this client only keeps live
+// cells, never tombstones, so a remote op naming an already-removed
+// identity as its parent/target can't be resolved here. See this file's
+// Known limitations.
+function findByIdentity(lines, id, peer) {
+    for (let row = 0; row < lines.length; row++) {
+        const line = lines[row];
+        if (line.anchor.id === id && line.anchor.peer === peer) {
+            return { kind: 'anchor', row };
+        }
+        for (let col = 0; col < line.cells.length; col++) {
+            if (line.cells[col].id === id && line.cells[col].peer === peer) {
+                return { kind: 'cell', row, col };
+            }
+        }
+    }
+    return null;
+}
+
+// Applies one incoming "network-add": resolves its parent by identity and
+// inserts right after it, and reflects it in the real buffer. No-op if the
+// parent can't be resolved (see findByIdentity). `relation.parent_id`/
+// `parent_peer` is already the real immediate predecessor in rendered
+// order, not a raw structural parent -- the server resolved any sibling
+// tie-break itself before sending this (see queue.rs's
+// `add_network_operation_inner`), so there's no ordering decision left to
+// make here at all.
+async function applyNetworkAdd(doc, lines, data) {
+    const { id, peer, relation } = data.crdt;
+    const parentPos = findByIdentity(lines, relation.parent_id, relation.parent_peer);
+    if (!parentPos) {
+        outputChannel.appendLine(
+            `network-add: couldn't resolve parent (${relation.parent_id}, ${relation.parent_peer}) in ${data.file_path} -- dropping`,
+        );
+        return;
+    }
+
+    const insertIdx = parentPos.kind === 'anchor' ? 0 : parentPos.col + 1;
+
+    if (relation.value === '\n') {
+        // mirrors add_line_to_projection: everything from the predecessor's
+        // own position onward in this line moves to a brand-new line, with
+        // this newline's own identity as that new line's anchor
+        const line = lines[parentPos.row];
+        const moved = line.cells.splice(insertIdx);
+        const anchor = { id, peer, tag: null };
+        lines.splice(parentPos.row + 1, 0, { anchor, cells: moved });
+
+        await applyBufferEdit(doc, (edit, uri) => {
+            edit.insert(uri, new vscode.Position(parentPos.row, insertIdx), '\n');
+        });
+        return;
+    }
+
+    const cell = { value: relation.value, id, peer, tag: null };
+    lines[parentPos.row].cells.splice(insertIdx, 0, cell);
+
+    await applyBufferEdit(doc, (edit, uri) => {
+        edit.insert(uri, new vscode.Position(parentPos.row, insertIdx), relation.value);
+    });
+}
+
+// Applies one incoming "network-remove": resolves the target by identity,
+// updates `lines`, and reflects it in the real buffer. No-op if the target
+// can't be resolved (already gone, or never known here -- see
+// findByIdentity).
+async function applyNetworkRemove(doc, lines, data) {
+    const pos = findByIdentity(lines, data.id, data.peer);
+    if (!pos) {
+        outputChannel.appendLine(`network-remove: couldn't resolve target (${data.id}, ${data.peer}) in ${data.file_path} -- dropping`);
+        return;
+    }
+
+    let range;
+    if (pos.kind === 'anchor') {
+        if (pos.row === 0) {
+            // the root sentinel -- the server never actually lets this be
+            // targeted, shouldn't happen in practice
+            return;
+        }
+        // removing a line's own anchor merges it onto the line above,
+        // mirroring removeAnchor's own local logic exactly
+        const prevLineLen = lines[pos.row - 1].cells.length;
+        const line = lines[pos.row];
+        lines[pos.row - 1].cells.push(...line.cells);
+        lines.splice(pos.row, 1);
+        range = new vscode.Range(pos.row - 1, prevLineLen, pos.row, 0);
+    } else {
+        lines[pos.row].cells.splice(pos.col, 1);
+        range = new vscode.Range(pos.row, pos.col, pos.row, pos.col + 1);
+    }
+
+    await applyBufferEdit(doc, (edit, uri) => {
+        edit.delete(uri, range);
+    });
 }
 
 // Called on every "disconnect". If the server process is actually gone (not

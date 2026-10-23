@@ -25,6 +25,7 @@ Then, inside that VS Code window, press `F5` to launch an Extension Development 
 - **Shar: Participate in Session** — joins an existing session by the exact name its creator used.
 - **Shar: Connect (attach to an already-running server)** — attaches to a `shar` server that's already running on this machine, without launching anything. Doesn't need a session name; it reads whatever the server was already started with.
 - **Shar: Update Server Binary** — checks GitHub for the newest *stable* shario release and downloads it, warning first if its major version differs from what this extension currently expects (a likely-breaking change). Enable the `shario.enableBeta` setting first if you want this to consider pre-release/beta builds too, not just stable ones.
+- **Shar: Disconnect** — ends the current session: disconnects the socket, and stops the server process too if this extension is the one that (re)started it.
 
 Type or delete in a tracked file afterward — check the **"Shar"** output channel (`View > Output`, select "Shar" from the dropdown) to see what's being sent, and what the server itself logs.
 
@@ -34,7 +35,8 @@ Type or delete in a tracked file afterward — check the **"Shar"** output chann
 
 ## Known limitations
 
-- Doesn't yet apply or render edits made by other collaborators — only sends this editor's own changes out.
+- A remote edit whose parent/target this client has never seen gets dropped, not guessed — this client only keeps live characters in memory, never tombstones, so an op referencing something already removed can't be resolved. Rare in practice (it needs two edits racing right at the same spot), and never corrupts anything; the edit is just silently skipped.
+- A remote edit only gets applied if the target file is already open in an editor here — there's no mechanism yet to open a file just because a peer edited it.
 - One extension instance per workspace folder; no UI yet for switching which folder/server you're connected to beyond reconnecting.
 
 ## License

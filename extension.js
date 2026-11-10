@@ -375,16 +375,80 @@ async function connectAndJoin() {
     // (`to_local_path`) before this callback ever fires, same as
     // "initial-state"'s own `file_path`. Confirmed directly against a real
     // two-server gossip run, not just read off queue.rs.
-    socket.on('network-add', async (data) => {
-        const doc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === data.file_path);
-        if (!doc) return; // not open here -- nothing to render it into
-        await applyNetworkAdd(doc, getOrCreateLines(doc), data);
+    socket.on('network-add', (data) => {
+        enqueueNetworkEdit(async () => {
+            const doc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === data.file_path);
+            if (!doc) return; // not open here -- nothing to render it into
+            await applyNetworkAdd(doc, getOrCreateLines(doc), data);
+        });
     });
 
-    socket.on('network-remove', async (data) => {
-        const doc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === data.file_path);
-        if (!doc) return;
-        await applyNetworkRemove(doc, getOrCreateLines(doc), data);
+    socket.on('network-remove', (data) => {
+        enqueueNetworkEdit(async () => {
+            const doc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === data.file_path);
+            if (!doc) return;
+            await applyNetworkRemove(doc, getOrCreateLines(doc), data);
+        });
+    });
+
+    // This client already rendered its own just-typed character instantly,
+    // using whatever it assumed was the predecessor at the time -- a
+    // concurrent remote sibling can land in between before this arrives.
+    // `data` here carries the real, just-resolved predecessor (same rewrite
+    // "network-add" gets), computed once add_crdt actually placed this
+    // character in the shar's own tree -- see queue.rs's
+    // add_ide_operation_inner. If this client's own rendering doesn't
+    // already agree, fix it: remove the character from wherever it
+    // currently sits and reinsert it where it actually belongs, reusing the
+    // exact same paths a remote op would take (applyNetworkRemove then
+    // applyNetworkAdd) rather than any new position-moving logic of its own.
+    socket.on('ide-add-complete', (data) => {
+        enqueueNetworkEdit(async () => {
+            const doc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === data.file_path);
+            if (!doc) return;
+
+            const lines = getOrCreateLines(doc);
+            const { id, peer, relation } = data.crdt;
+
+            const selfPos = findByIdentity(lines, id, peer);
+            if (!selfPos) {
+                outputChannel.appendLine(
+                    `ide-add-complete: couldn't find my own character (${id}, ${peer}) in ${data.file_path} -- skipping`,
+                );
+                return;
+            }
+
+            const predPos = findByIdentity(lines, relation.parent_id, relation.parent_peer);
+            if (!predPos) {
+                outputChannel.appendLine(
+                    `ide-add-complete: couldn't resolve real predecessor (${relation.parent_id}, ${relation.parent_peer}) in ${data.file_path} -- skipping`,
+                );
+                return;
+            }
+
+            // a newline becomes the *anchor* of the line right after its
+            // predecessor, not a cell -- different shape of "already
+            // correct." Being on the right row isn't enough by itself: the
+            // split only really happened in the right place if nothing else
+            // is still sitting after the predecessor on its own row (a
+            // correct split would have moved anything after it onto this
+            // new line already).
+            const alreadyCorrect =
+                relation.value === '\n'
+                    ? selfPos.kind === 'anchor' &&
+                      selfPos.row === predPos.row + 1 &&
+                      (predPos.kind === 'anchor'
+                          ? lines[predPos.row].cells.length === 0
+                          : predPos.col === lines[predPos.row].cells.length - 1)
+                    : selfPos.kind === 'cell' &&
+                      selfPos.row === predPos.row &&
+                      selfPos.col === (predPos.kind === 'anchor' ? 0 : predPos.col + 1);
+
+            if (alreadyCorrect) return;
+
+            await applyNetworkRemove(doc, lines, { file_path: data.file_path, id, peer });
+            await applyNetworkAdd(doc, lines, data);
+        });
     });
 }
 
@@ -567,6 +631,32 @@ function emitRemove(filePath, row, col, isWholeLine, id, peer) {
     outputChannel.appendLine(`remove: ${JSON.stringify(payload)}`);
 }
 
+// Serializes every incoming "network-add"/"network-remove" into one global
+// queue, instead of letting socket.io fire each handler independently.
+// `applyNetworkAdd`/`applyNetworkRemove` compute a position from `lines`
+// assuming every earlier edit has already landed in the real buffer -- true
+// only if each one's own `vscode.workspace.applyEdit` has actually resolved
+// before the next one starts. Without this, a fast burst (quick typing,
+// several peers at once, a bulk delete) lets multiple edits run
+// concurrently: `lines` itself stays correctly ordered (its mutation is
+// synchronous), but the real document can receive them out of order, and
+// `applyingRemoteEdit` below -- a single shared flag -- can flip back to
+// `false` while an earlier edit is still in flight, letting
+// `onDidChangeTextDocument` mistake it for new local typing. One global
+// queue (not per-document) matches `applyingRemoteEdit`'s own scope, and a
+// typical session only ever touches a handful of files anyway. A task that
+// throws doesn't stall the ones after it -- `.then(run, run)` runs the next
+// task regardless of whether the previous one succeeded.
+let networkEditQueue = Promise.resolve();
+function enqueueNetworkEdit(task) {
+    const run = () =>
+        Promise.resolve()
+            .then(task)
+            .catch((err) => outputChannel.appendLine(`network edit failed: ${(err && err.stack) || err}`));
+    networkEditQueue = networkEditQueue.then(run, run);
+    return networkEditQueue;
+}
+
 // Set while this extension is itself applying a remote edit to a buffer --
 // `onDidChangeTextDocument` checks this to avoid re-sending someone else's
 // edit back to the server as if it were new local typing.
@@ -613,6 +703,13 @@ function findByIdentity(lines, id, peer) {
 // make here at all.
 async function applyNetworkAdd(doc, lines, data) {
     const { id, peer, relation } = data.crdt;
+
+    // idempotent, matching add_crdt's own repeated-key no-op server-side --
+    // a duplicate delivery (a retry, a reconnect replay, anything) must not
+    // double-insert; for a newline specifically that would otherwise show
+    // up as an extra blank line.
+    if (findByIdentity(lines, id, peer)) return;
+
     const parentPos = findByIdentity(lines, relation.parent_id, relation.parent_peer);
     if (!parentPos) {
         outputChannel.appendLine(
